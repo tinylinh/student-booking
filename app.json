@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Study Room Booking",
+    "slug": "study-room-booking",
+    "scheme": "studyroombooking",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#2457F5"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {},
+    "plugins": [
+      "expo-secure-store",
+      "expo-web-browser"
+    ]
+  }
+}
