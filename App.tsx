@@ -1,3 +1,4 @@
+import Animated, { FadeIn, FadeInDown, FadeOut, LinearTransition, ReduceMotion, SlideInLeft, SlideInRight, ZoomIn, ZoomOut, runOnJS } from "react-native-reanimated";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Alert,
@@ -8,36 +9,46 @@ import {
   ImageSourcePropType,
   KeyboardAvoidingView,
   Modal,
+  PanResponder,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   StatusBar,
+  Switch,
   Text,
   TextInput,
   View,
   ViewStyle,
 } from "react-native";
-import { NavigationContainer, useNavigation } from "@react-navigation/native";
+import { NavigationContainer, NavigatorScreenParams, useNavigation } from "@react-navigation/native";
 import {
   createNativeStackNavigator,
+  NativeStackNavigationProp,
   NativeStackScreenProps,
 } from "@react-navigation/native-stack";
-import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { BottomTabNavigationProp, createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Gesture, GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { BlurView } from "expo-blur";
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Linking from "expo-linking";
 import * as WebBrowser from "expo-web-browser";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { create } from "zustand";
+
+const { createJSONStorage, persist } = require("zustand/middleware") as typeof import("zustand/middleware");
 import { supabase, vietQrConfig } from "./src/lib/supabase";
 import {
+  addFavoriteRoom,
   cancelBookingHold,
   getBookingRooms,
+  getMyFavoriteRoomIds,
   getMyBookings,
   getRoomAvailability,
   holdBookingResources,
+  removeFavoriteRoom,
   submitBookingTransfer,
 } from "./src/lib/bookingApi";
 
@@ -125,6 +136,54 @@ const ROOMS: Room[] = [
   },
 ];
 
+const HOME_BANNERS = [
+  {
+    id: "meeting",
+    label: "Meeting rooms",
+    room: ROOMS[0],
+    kicker: "A BETTER PLACE TO FOCUS",
+    title: `Rooms made for${"\n"}big ideas.`,
+    action: "Explore meeting rooms",
+  },
+  {
+    id: "library",
+    label: "Library",
+    room: ROOMS[3],
+    kicker: "A QUIETER WAY TO RESET",
+    title: `Read, reflect${"\n"}and grow.`,
+    action: "Explore the library",
+  },
+  {
+    id: "study",
+    label: "Study rooms",
+    room: ROOMS[4],
+    kicker: "YOUR NEXT FOCUS ZONE",
+    title: `Find your flow,${"\n"}one hour at a time.`,
+    action: "Explore study rooms",
+  },
+];
+
+async function getRoomCatalog(): Promise<Room[]> {
+  if (!supabase) return ROOMS;
+  const storedRooms = await getBookingRooms();
+  const mappedRooms = storedRooms.flatMap((stored) => {
+    const bundledRoom = ROOMS.find((room) => room.id === stored.id);
+    if (!bundledRoom) return [];
+    return [{
+      ...bundledRoom,
+      name: stored.name,
+      category: stored.category,
+      building: stored.building,
+      floor: stored.floor,
+      facilities: stored.facilities,
+      seats: stored.capacity,
+      bookingMode: stored.booking_mode,
+      hourlyRate: stored.hourly_rate,
+    }];
+  });
+  return mappedRooms.length > 0 ? mappedRooms : ROOMS;
+}
+
 type Booking = {
   id: string;
   paymentReference: string;
@@ -137,6 +196,8 @@ type Booking = {
   paymentStatus: "awaiting-payment" | "awaiting-review" | "confirmed" | "cancelled" | "expired";
 };
 
+const EMPTY_BOOKINGS: Booking[] = [];
+
 type SeatReservation = {
   roomId: string;
   date: string;
@@ -148,12 +209,17 @@ type SeatReservation = {
 };
 
 type BookingStore = {
-  bookings: Booking[];
+  bookingsByUserId: Record<string, Booking[]>;
+  favoriteRoomIdsByUserId: Record<string, string[]>;
   reservations: SeatReservation[];
   setRoomAvailability: (roomId: string, date: string, reservations: SeatReservation[]) => void;
-  setBookings: (bookings: Booking[]) => void;
-  upsertBooking: (booking: Booking) => void;
+  setBookings: (userId: string, bookings: Booking[]) => void;
+  upsertBooking: (userId: string, booking: Booking) => void;
+  setFavoriteRoomIds: (userId: string, roomIds: string[]) => void;
+  toggleFavoriteRoom: (userId: string, roomId: string) => void;
 };
+
+const EMPTY_FAVORITE_ROOM_IDS: string[] = [];
 
 const formatTimeRange = (startTime: string, durationHours: number) => {
   const [hours, minutes] = startTime.split(":").map(Number);
@@ -171,29 +237,136 @@ const timeRangeOverlaps = (first: string, second: string) => {
 };
 const formatCurrency = (amount: number) =>
   `${new Intl.NumberFormat("vi-VN").format(amount)} đ`;
-const useBookingStore = create<BookingStore>((set) => ({
-  bookings: [],
-  reservations: [],
-  setRoomAvailability: (roomId, date, nextReservations) => set((state) => ({
-    reservations: [
-      ...state.reservations.filter((item) => item.roomId !== roomId || item.date !== date),
-      ...nextReservations,
-    ],
-  })),
-  setBookings: (bookings) => set({ bookings }),
-  upsertBooking: (booking) => set((state) => ({
-    bookings: [booking, ...state.bookings.filter((item) => item.id !== booking.id)],
-  })),
-}));
+const useBookingStore = create<BookingStore>()(
+  persist<BookingStore, [], [], Pick<BookingStore, "bookingsByUserId" | "favoriteRoomIdsByUserId">>(
+    (set) => ({
+      bookingsByUserId: {},
+      favoriteRoomIdsByUserId: {},
+      reservations: [],
+      setRoomAvailability: (roomId, date, nextReservations) => set((state) => ({
+        reservations: [
+          ...state.reservations.filter((item) => item.roomId !== roomId || item.date !== date),
+          ...nextReservations,
+        ],
+      })),
+      setBookings: (userId, bookings) => set((state) => ({
+        bookingsByUserId: { ...state.bookingsByUserId, [userId]: bookings },
+      })),
+      upsertBooking: (userId, booking) => set((state) => ({
+        bookingsByUserId: {
+          ...state.bookingsByUserId,
+          [userId]: [booking, ...(state.bookingsByUserId[userId] ?? []).filter((item) => item.id !== booking.id)],
+        },
+      })),
+      setFavoriteRoomIds: (userId, roomIds) => set((state) => ({
+        favoriteRoomIdsByUserId: { ...state.favoriteRoomIdsByUserId, [userId]: roomIds },
+      })),
+      toggleFavoriteRoom: (userId, roomId) => set((state) => {
+        const currentIds = state.favoriteRoomIdsByUserId[userId] ?? [];
+        return {
+          favoriteRoomIdsByUserId: {
+            ...state.favoriteRoomIdsByUserId,
+            [userId]: currentIds.includes(roomId)
+              ? currentIds.filter((id) => id !== roomId)
+              : [...currentIds, roomId],
+          },
+        };
+      }),
+    }),
+    {
+      name: "study-room-bookings-v1",
+      storage: createJSONStorage(() => AsyncStorage),
+      partialize: (state) => ({
+        bookingsByUserId: state.bookingsByUserId,
+        favoriteRoomIdsByUserId: state.favoriteRoomIdsByUserId,
+      }),
+    },
+  ),
+);
+
+function useRoomFavorites() {
+  const [userId, setUserId] = useState(supabase ? "" : "local");
+  const [loading, setLoading] = useState(Boolean(supabase));
+  const [loadError, setLoadError] = useState("");
+  const favoriteRoomIds = useBookingStore((state) => userId
+    ? state.favoriteRoomIdsByUserId[userId] ?? EMPTY_FAVORITE_ROOM_IDS
+    : EMPTY_FAVORITE_ROOM_IDS);
+  const setFavoriteRoomIds = useBookingStore((state) => state.setFavoriteRoomIds);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client) {
+      setUserId("local");
+      setLoading(false);
+      return;
+    }
+    let active = true;
+    void client.auth.getUser().then(async ({ data, error }) => {
+      if (error) throw error;
+      if (!data.user) {
+        if (active) setLoading(false);
+        return;
+      }
+      const currentUserId = data.user.id;
+      if (active) setUserId(currentUserId);
+      const storedRoomIds = await getMyFavoriteRoomIds();
+      if (active) setFavoriteRoomIds(currentUserId, storedRoomIds);
+    }).catch((error: unknown) => {
+      if (active) {
+        setLoadError(error instanceof Error
+          ? error.message
+          : "Could not load saved spaces. Apply the favorites database migration first.");
+      }
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => { active = false; };
+  }, [setFavoriteRoomIds]);
+
+  const toggleFavorite = async (roomId: string) => {
+    if (!userId) {
+      Alert.alert("Favorites unavailable", "Sign in again to manage saved spaces.");
+      return;
+    }
+    const previousIds = useBookingStore.getState().favoriteRoomIdsByUserId[userId] ?? [];
+    const wasFavorite = previousIds.includes(roomId);
+    useBookingStore.getState().toggleFavoriteRoom(userId, roomId);
+    if (!supabase) return;
+
+    try {
+      if (wasFavorite) await removeFavoriteRoom(roomId);
+      else await addFavoriteRoom(roomId);
+    } catch (error) {
+      setFavoriteRoomIds(userId, previousIds);
+      Alert.alert("Could not update favorites", error instanceof Error ? error.message : "Please try again.");
+    }
+  };
+
+  return { favoriteRoomIds, toggleFavorite, loading, loadError };
+}
 
 type RootStackParamList = {
-  MainTabs: undefined;
+  MainTabs: NavigatorScreenParams<MainTabParamList> | undefined;
   RoomDetail: { room: Room };
   Booking: { room: Room };
+  PersonalInfo: undefined;
+  Favorites: undefined;
+  Notifications: undefined;
+  AppSettings: undefined;
+  HelpCenter: undefined;
+  Handbook: undefined;
+  Community: undefined;
+};
+
+type MainTabParamList = {
+  Browse: undefined;
+  Classes: undefined;
+  Bookings: undefined;
+  Profile: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
-const Tab = createBottomTabNavigator();
+const Tab = createBottomTabNavigator<MainTabParamList>();
 
 const queryClient = new QueryClient();
 
@@ -211,94 +384,146 @@ function Header({ title, subtitle }: { title: string; subtitle?: string }) {
   );
 }
 
-function RoomCard({ room }: { room: Room }) {
+function FavoriteIcon({ isFavorite, size = 19 }: { isFavorite: boolean; size?: number }) {
+  return (
+    <Animated.View
+      key={isFavorite ? "favorite" : "not-favorite"}
+      entering={ZoomIn.springify().damping(12).reduceMotion(ReduceMotion.System)}
+      exiting={ZoomOut.duration(100).reduceMotion(ReduceMotion.System)}
+    >
+      <Ionicons
+        name={isFavorite ? "heart" : "heart-outline"}
+        size={size}
+        color={isFavorite ? "#E64E68" : "#273754"}
+      />
+    </Animated.View>
+  );
+}
+
+function RoomCard({
+  room,
+  isFavorite = false,
+  onToggleFavorite,
+}: {
+  room: Room;
+  isFavorite?: boolean;
+  onToggleFavorite?: (roomId: string) => void | Promise<void>;
+}) {
   const navigation =
     useNavigation<NativeStackScreenProps<RootStackParamList>["navigation"]>();
 
   return (
-    <Pressable
-      style={styles.roomCard}
-      onPress={() => navigation.navigate("RoomDetail", { room })}
-    >
-      <View style={styles.roomCardImageWrap}>
-        <Image source={room.image} style={styles.roomImage} />
-        <View style={styles.roomCategoryPill}>
-          <Text style={styles.roomCategoryText}>{room.category}</Text>
+    <View style={styles.roomCard}>
+      <Pressable
+        style={styles.roomCardContent}
+        onPress={() => navigation.navigate("RoomDetail", { room })}
+      >
+        <View style={styles.roomCardImageWrap}>
+          <Image source={room.image} style={styles.roomImage} />
+          <View style={styles.roomCategoryPill}>
+            <Text style={styles.roomCategoryText}>{room.category}</Text>
+          </View>
         </View>
-      </View>
-      <View style={styles.roomBody}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.roomName}>{room.name}</Text>
-          <View
-            style={[
-              styles.statusPill,
-              room.status === "Available"
-                ? styles.availablePill
-                : styles.occupiedPill,
-            ]}
-          >
-            <Text
+        <View style={styles.roomBody}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.roomName}>{room.name}</Text>
+            <View
               style={[
-                styles.statusText,
+                styles.statusPill,
                 room.status === "Available"
-                  ? styles.availableText
-                  : styles.occupiedText,
+                  ? styles.availablePill
+                  : styles.occupiedPill,
               ]}
             >
-              {room.status}
-            </Text>
+              <Text
+                style={[
+                  styles.statusText,
+                  room.status === "Available"
+                    ? styles.availableText
+                    : styles.occupiedText,
+                ]}
+              >
+                {room.status}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.roomCardMeta}>
+            <Ionicons name="location-outline" size={14} color="#8A929F" />
+            <Text style={styles.roomLocation}>{room.building} · {room.floor}</Text>
+          </View>
+          <View style={styles.roomCardFooter}>
+            <View>
+              <Text style={styles.roomRate}>{formatCurrency(room.hourlyRate)}<Text style={styles.roomRateUnit}> / hr</Text></Text>
+              <Text style={styles.roomCapacity}>{room.bookingMode === "whole-room" ? `Entire room · ${room.seats} people` : `${room.seats} reservable seats`}</Text>
+            </View>
+            <View style={styles.roomCardArrow}><Ionicons name="arrow-forward" size={17} color="#2457F5" /></View>
           </View>
         </View>
-        <View style={styles.roomCardMeta}>
-          <Ionicons name="location-outline" size={14} color="#8A929F" />
-          <Text style={styles.roomLocation}>{room.building} · {room.floor}</Text>
-        </View>
-        <View style={styles.roomCardFooter}>
-          <View>
-            <Text style={styles.roomRate}>{formatCurrency(room.hourlyRate)}<Text style={styles.roomRateUnit}> / hr</Text></Text>
-            <Text style={styles.roomCapacity}>{room.bookingMode === "whole-room" ? `Entire room · ${room.seats} people` : `${room.seats} reservable seats`}</Text>
-          </View>
-          <View style={styles.roomCardArrow}><Ionicons name="arrow-forward" size={17} color="#2457F5" /></View>
-        </View>
-      </View>
-    </Pressable>
+      </Pressable>
+      {onToggleFavorite ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={isFavorite ? `Remove ${room.name} from favorites` : `Add ${room.name} to favorites`}
+          accessibilityState={{ selected: isFavorite }}
+          style={styles.roomCardFavorite}
+          onPress={() => { void onToggleFavorite(room.id); }}
+        >
+          <FavoriteIcon isFavorite={isFavorite} size={17} />
+        </Pressable>
+      ) : null}
+    </View>
   );
 }
 
 function BrowseRooms() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
-  const [roomCatalog, setRoomCatalog] = useState(ROOMS);
-  const [catalogError, setCatalogError] = useState("");
+  const [activeBannerIndex, setActiveBannerIndex] = useState(0);
+  const [bannerDirection, setBannerDirection] = useState<1 | -1>(1);
+  const { favoriteRoomIds, toggleFavorite } = useRoomFavorites();
   const navigation = useNavigation<NativeStackScreenProps<RootStackParamList>["navigation"]>();
+  const tabNavigation = useNavigation<BottomTabNavigationProp<MainTabParamList>>();
+  const activeBanner = HOME_BANNERS[activeBannerIndex];
 
   useEffect(() => {
-    if (!supabase) return;
-    let active = true;
-    void getBookingRooms().then((storedRooms) => {
-      if (!active) return;
-      const mappedRooms = storedRooms.flatMap((stored) => {
-        const bundledRoom = ROOMS.find((room) => room.id === stored.id);
-        if (!bundledRoom) return [];
-        return [{
-          ...bundledRoom,
-          name: stored.name,
-          category: stored.category,
-          building: stored.building,
-          floor: stored.floor,
-          facilities: stored.facilities,
-          seats: stored.capacity,
-          bookingMode: stored.booking_mode,
-          hourlyRate: stored.hourly_rate,
-        }];
-      });
-      if (mappedRooms.length > 0) setRoomCatalog(mappedRooms);
-      setCatalogError("");
-    }).catch((error: unknown) => {
-      if (active) setCatalogError(error instanceof Error ? error.message : "Could not load the room catalog.");
-    });
-    return () => { active = false; };
-  }, []);
+    const timer = setTimeout(() => {
+      setBannerDirection(1);
+      setActiveBannerIndex((current) => (current + 1) % HOME_BANNERS.length);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [activeBannerIndex]);
+
+  const bannerSwipeGesture = useMemo(() => Gesture.Pan()
+    .activeOffsetX([-14, 14])
+    .failOffsetY([-10, 10])
+    .onEnd((event) => {
+      if (event.translationX < -48) {
+        runOnJS(setBannerDirection)(1);
+        runOnJS(setActiveBannerIndex)((activeBannerIndex + 1) % HOME_BANNERS.length);
+      } else if (event.translationX > 48) {
+        runOnJS(setBannerDirection)(-1);
+        runOnJS(setActiveBannerIndex)((activeBannerIndex - 1 + HOME_BANNERS.length) % HOME_BANNERS.length);
+      }
+    }), [activeBannerIndex]);
+  const webSwipePanResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_, gestureState) =>
+      Math.abs(gestureState.dx) > 18 && Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.2,
+    onPanResponderRelease: (_, gestureState) => {
+      if (gestureState.dx < -48) {
+        setBannerDirection(1);
+        setActiveBannerIndex((current) => (current + 1) % HOME_BANNERS.length);
+      } else if (gestureState.dx > 48) {
+        setBannerDirection(-1);
+        setActiveBannerIndex((current) => (current - 1 + HOME_BANNERS.length) % HOME_BANNERS.length);
+      }
+    },
+  }), []);
+
+  const roomCatalogQuery = useQuery<Room[], Error>({
+    queryKey: ["room-catalog"],
+    queryFn: getRoomCatalog,
+  });
+  const roomCatalog = roomCatalogQuery.data ?? ROOMS;
 
   const filteredRooms = useMemo(() => {
     return roomCatalog.filter((room) => {
@@ -314,79 +539,136 @@ function BrowseRooms() {
     });
   }, [roomCatalog, search, filter]);
 
+  const listHeader = (
+    <>
+      <View style={styles.homeHeader}>
+        <View>
+          <Text style={styles.homeEyebrow}>STUDY & MEET</Text>
+          <Text style={styles.homeTitle}>Find your space</Text>
+        </View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Open profile"
+          style={styles.homeAvatar}
+          onPress={() => tabNavigation.navigate("Profile")}
+        >
+          <Text style={styles.avatarText}>KL</Text>
+        </Pressable>
+      </View>
+
+      <GestureDetector gesture={bannerSwipeGesture}>
+        <Animated.View
+          key={activeBanner.id}
+          {...(Platform.OS === "web" ? webSwipePanResponder.panHandlers : {})}
+          entering={bannerDirection > 0
+            ? SlideInRight.duration(260).reduceMotion(ReduceMotion.System)
+            : SlideInLeft.duration(260).reduceMotion(ReduceMotion.System)}
+          style={styles.homeHeroFrame}
+        >
+          <ImageBackground source={activeBanner.room.image} imageStyle={styles.homeHeroImage} style={styles.homeHero}>
+            <View style={styles.homeHeroTop}>
+              <View style={styles.heroAvailability}><View style={styles.heroAvailabilityDot} /><Text style={styles.heroAvailabilityText}>Spaces available today</Text></View>
+              <Ionicons name="sparkles-outline" size={20} color="#fff" />
+            </View>
+            <View style={styles.homeHeroBottom}>
+              <BlurView intensity={48} tint="dark" style={styles.homeHeroGlass}>
+                <Text style={styles.homeHeroKicker}>{activeBanner.kicker}</Text>
+                <Text style={styles.homeHeroTitle}>{activeBanner.title}</Text>
+                <Pressable style={styles.homeHeroAction} onPress={() => navigation.navigate("RoomDetail", { room: activeBanner.room })}>
+                  <Text style={styles.homeHeroActionText}>{activeBanner.action}</Text>
+                  <Ionicons name="arrow-forward" size={16} color="#17213A" />
+                </Pressable>
+              </BlurView>
+              <View style={styles.homeHeroPagination} accessibilityRole="tablist">
+                {HOME_BANNERS.map((banner, index) => (
+                  <Pressable
+                    key={banner.id}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Show ${banner.label} banner`}
+                    accessibilityState={{ selected: activeBannerIndex === index }}
+                    onPress={() => {
+                      const stepsForward = (index - activeBannerIndex + HOME_BANNERS.length) % HOME_BANNERS.length;
+                      setBannerDirection(stepsForward > 0 && stepsForward <= HOME_BANNERS.length / 2 ? 1 : -1);
+                      setActiveBannerIndex(index);
+                    }}
+                    style={styles.homeHeroDotButton}
+                  >
+                    <View style={[styles.homeHeroDot, activeBannerIndex === index && styles.homeHeroDotActive]} />
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          </ImageBackground>
+        </Animated.View>
+      </GestureDetector>
+
+      <View style={styles.homeSearchRow}>
+        <Ionicons name="search-outline" size={19} color="#8A929F" />
+        <TextInput
+          value={search}
+          onChangeText={setSearch}
+          placeholder="Search rooms or locations"
+          placeholderTextColor="#98A2B3"
+          style={styles.homeSearchInput}
+        />
+        <Pressable accessibilityRole="button" accessibilityLabel="Clear search" onPress={() => setSearch("")}>
+          <Ionicons name={search ? "close-circle" : "search-outline"} size={19} color="#667085" />
+        </Pressable>
+      </View>
+
+      {roomCatalogQuery.isError ? (
+        <View style={styles.bookingErrorNotice}>
+          <Ionicons name="alert-circle-outline" size={19} color="#B42318" />
+          <Text style={styles.bookingErrorText}>Room data needs the Supabase migration: {roomCatalogQuery.error.message}</Text>
+        </View>
+      ) : null}
+
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.homeCategoryRow}>
+        {["All", "Meeting room", "Library", "Study room"].map((item, index) => (
+          <Pressable key={item} onPress={() => setFilter(item)} style={[styles.homeCategory, filter === item && styles.homeCategoryActive]}>
+            <Ionicons
+              name={index === 0 ? "apps-outline" : index === 1 ? "people-outline" : index === 2 ? "library-outline" : "book-outline"}
+              size={15}
+              color={filter === item ? "#fff" : "#667085"}
+            />
+            <Text style={[styles.homeCategoryText, filter === item && styles.homeCategoryTextActive]}>{item}</Text>
+          </Pressable>
+        ))}
+      </ScrollView>
+
+      <View style={styles.homeSectionHeader}>
+        <View><Text style={styles.homeSectionTitle}>Spaces for you</Text><Text style={styles.homeSectionCaption}>{filteredRooms.length} spaces to explore</Text></View>
+        <Ionicons name="options-outline" size={19} color="#667085" />
+      </View>
+    </>
+  );
+
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.homeScroll}>
-        <View style={styles.homeHeader}>
-          <View>
-            <Text style={styles.homeEyebrow}>STUDY & MEET</Text>
-            <Text style={styles.homeTitle}>Find your space</Text>
-          </View>
-          <View style={styles.homeAvatar}>
-            <Text style={styles.avatarText}>KL</Text>
-          </View>
-        </View>
-
-        <ImageBackground source={ROOMS[0].image} imageStyle={styles.homeHeroImage} style={styles.homeHero}>
-          <View style={styles.homeHeroTop}>
-            <View style={styles.heroAvailability}><View style={styles.heroAvailabilityDot} /><Text style={styles.heroAvailabilityText}>Spaces available today</Text></View>
-            <Ionicons name="sparkles-outline" size={20} color="#fff" />
-          </View>
-          <View style={styles.homeHeroBottom}>
-            <BlurView intensity={48} tint="dark" style={styles.homeHeroGlass}>
-              <Text style={styles.homeHeroKicker}>A BETTER PLACE TO FOCUS</Text>
-              <Text style={styles.homeHeroTitle}>Rooms made for{`\n`}big ideas.</Text>
-              <Pressable style={styles.homeHeroAction} onPress={() => navigation.navigate("RoomDetail", { room: ROOMS[0] })}>
-                <Text style={styles.homeHeroActionText}>Explore meeting rooms</Text>
-                <Ionicons name="arrow-forward" size={16} color="#17213A" />
-              </Pressable>
-            </BlurView>
-          </View>
-        </ImageBackground>
-
-        <View style={styles.homeSearchRow}>
-          <Ionicons name="search-outline" size={19} color="#8A929F" />
-          <TextInput
-            value={search}
-            onChangeText={setSearch}
-            placeholder="Search rooms or locations"
-            placeholderTextColor="#98A2B3"
-            style={styles.homeSearchInput}
-          />
-          <Pressable accessibilityRole="button" accessibilityLabel="Clear search" onPress={() => setSearch("")}>
-            <Ionicons name={search ? "close-circle" : "search-outline"} size={19} color="#667085" />
-          </Pressable>
-        </View>
-
-        {catalogError ? (
-          <View style={styles.bookingErrorNotice}>
-            <Ionicons name="alert-circle-outline" size={19} color="#B42318" />
-            <Text style={styles.bookingErrorText}>Room data needs the Supabase migration: {catalogError}</Text>
-          </View>
-        ) : null}
-
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.homeCategoryRow}>
-          {["All", "Meeting room", "Library", "Study room"].map((item, index) => (
-            <Pressable key={item} onPress={() => setFilter(item)} style={[styles.homeCategory, filter === item && styles.homeCategoryActive]}>
-              <Ionicons
-                name={index === 0 ? "apps-outline" : index === 1 ? "people-outline" : index === 2 ? "library-outline" : "book-outline"}
-                size={15}
-                color={filter === item ? "#fff" : "#667085"}
-              />
-              <Text style={[styles.homeCategoryText, filter === item && styles.homeCategoryTextActive]}>{item}</Text>
-            </Pressable>
-          ))}
-        </ScrollView>
-
-        <View style={styles.homeSectionHeader}>
-          <View><Text style={styles.homeSectionTitle}>Spaces for you</Text><Text style={styles.homeSectionCaption}>{filteredRooms.length} spaces to explore</Text></View>
-          <Ionicons name="options-outline" size={19} color="#667085" />
-        </View>
-        <View style={styles.homeRoomList}>
-          {filteredRooms.map((room) => <RoomCard key={room.id} room={room} />)}
-          {filteredRooms.length === 0 && <Text style={styles.emptyText}>No rooms match this search.</Text>}
-        </View>
-      </ScrollView>
+      <FlatList
+        data={filteredRooms}
+        keyExtractor={(room) => room.id}
+        contentContainerStyle={styles.homeScroll}
+        showsVerticalScrollIndicator={false}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={roomCatalogQuery.isLoading
+          ? <ActivityIndicator style={styles.homeEmptyText} size="small" color="#2457F5" />
+          : <Text style={[styles.emptyText, styles.homeEmptyText]}>No rooms match this search.</Text>}
+        refreshing={roomCatalogQuery.isRefetching}
+        onRefresh={() => { void roomCatalogQuery.refetch(); }}
+        renderItem={({ item, index }) => (
+          <Animated.View
+            entering={FadeInDown.delay(Math.min(index, 6) * 45).duration(350)}
+            style={styles.homeRoomItem}
+          >
+            <RoomCard
+              room={item}
+              isFavorite={favoriteRoomIds.includes(item.id)}
+              onToggleFavorite={toggleFavorite}
+            />
+          </Animated.View>
+        )}
+      />
     </SafeAreaView>
   );
 }
@@ -396,6 +678,8 @@ function RoomDetail({
   navigation,
 }: NativeStackScreenProps<RootStackParamList, "RoomDetail">) {
   const { room } = route.params;
+  const { favoriteRoomIds, toggleFavorite } = useRoomFavorites();
+  const isFavorite = favoriteRoomIds.includes(room.id);
 
   return (
     <SafeAreaView style={styles.detailPage} edges={[]}>
@@ -406,8 +690,16 @@ function RoomDetail({
               <Pressable style={styles.detailGlassButton} onPress={() => navigation.goBack()}>
                 <BlurView intensity={48} tint="light" style={styles.detailGlassInner}><Ionicons name="arrow-back" size={20} color="#17213A" /></BlurView>
               </Pressable>
-              <Pressable style={styles.detailGlassButton}>
-                <BlurView intensity={48} tint="light" style={styles.detailGlassInner}><Ionicons name="heart-outline" size={20} color="#17213A" /></BlurView>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={isFavorite ? `Remove ${room.name} from favorites` : `Add ${room.name} to favorites`}
+                accessibilityState={{ selected: isFavorite }}
+                style={styles.detailGlassButton}
+                onPress={() => { void toggleFavorite(room.id); }}
+              >
+                <BlurView intensity={48} tint="light" style={styles.detailGlassInner}>
+                  <FavoriteIcon isFavorite={isFavorite} size={20} />
+                </BlurView>
               </Pressable>
             </View>
             <View style={styles.detailHeroCaption}>
@@ -771,7 +1063,7 @@ function BookingScreen({
         customerEmail,
         customerPhone,
       });
-      upsertBooking({ ...pendingBooking, paymentStatus: "awaiting-review" });
+      upsertBooking(currentUserId, { ...pendingBooking, paymentStatus: "awaiting-review" });
       await refreshAvailability(date);
       preserveHold.current = true;
       setStage("submitted");
@@ -1033,7 +1325,7 @@ function BookingScreen({
             <Text style={styles.paymentCompleteTitle}>Transfer submitted</Text>
             <Text style={styles.paymentCompleteText}>Booking {pendingBooking.id} is waiting for payment verification. It is not confirmed yet.</Text>
             <Text style={styles.paymentCompleteAmount}>{formatCurrency(pendingBooking.totalPrice)}</Text>
-            <Pressable style={styles.primaryButton} onPress={() => navigation.navigate("MainTabs")}>
+            <Pressable style={styles.primaryButton} onPress={() => navigation.navigate("MainTabs", { screen: "Bookings" })}>
               <Text style={styles.primaryButtonText}>View my bookings</Text>
             </Pressable>
           </View>
@@ -1071,18 +1363,33 @@ function BookingScreen({
 }
 
 function MyBookings() {
-  const bookings = useBookingStore((s) => s.bookings);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const bookings = useBookingStore((s) => currentUserId
+    ? s.bookingsByUserId[currentUserId] ?? EMPTY_BOOKINGS
+    : EMPTY_BOOKINGS);
   const setBookings = useBookingStore((s) => s.setBookings);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
-    if (!supabase) {
+    const client = supabase;
+    if (!client) {
       setLoading(false);
       return;
     }
     let active = true;
     const refresh = async () => {
+      const { data, error } = await client.auth.getUser();
+      if (error) throw error;
+      if (!data.user) {
+        if (active) {
+          setCurrentUserId(null);
+          setLoading(false);
+        }
+        return;
+      }
+      const userId = data.user.id;
+      if (active) setCurrentUserId(userId);
       const stored = await getMyBookings();
       if (!active) return;
       const mapped = stored.flatMap((item) => {
@@ -1103,7 +1410,7 @@ function MyBookings() {
           paymentStatus: status,
         }];
       });
-      setBookings(mapped);
+      setBookings(userId, mapped);
       setLoadError("");
       setLoading(false);
     };
@@ -1113,11 +1420,6 @@ function MyBookings() {
       setLoading(false);
     });
 
-    const client = supabase;
-    if (!client) {
-      setLoading(false);
-      return;
-    }
     let channel: ReturnType<typeof client.channel> | undefined;
     void client.auth.getUser().then(({ data }) => {
       if (!active || !data.user) return;
@@ -1268,39 +1570,499 @@ function SeatLegend({ color, label }: { color: ViewStyle; label: string }) {
   );
 }
 
-function Profile() {
-  const signOut = () => {
-    if (supabase) void supabase.auth.signOut();
+function ProfileSubpage({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string;
+  subtitle: string;
+  children: React.ReactNode;
+}) {
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+
+  return (
+    <SafeAreaView style={styles.profileSubpage} edges={["top", "bottom"]}>
+      <View style={styles.profileSubpageHeader}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Go back" style={styles.profileBackButton} onPress={() => navigation.goBack()}>
+          <Ionicons name="arrow-back" size={20} color="#172744" />
+        </Pressable>
+        <View style={styles.profileSubpageHeading}>
+          <Text style={styles.profileSubpageTitle}>{title}</Text>
+          <Text style={styles.profileSubpageSubtitle}>{subtitle}</Text>
+        </View>
+        <View style={styles.profileBackButtonSpacer} />
+      </View>
+      <ScrollView contentContainerStyle={styles.profileSubpageContent} showsVerticalScrollIndicator={false}>
+        {children}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function PersonalInfo() {
+  const [fullName, setFullName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [saveError, setSaveError] = useState("");
+
+  useEffect(() => {
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+    let active = true;
+    void supabase.auth.getUser().then(({ data, error }) => {
+      if (!active) return;
+      if (error) {
+        setSaveError(error.message);
+        setLoading(false);
+        return;
+      }
+      const user = data.user;
+      if (user) {
+        setFullName(String(user.user_metadata.full_name ?? ""));
+        setPhone(String(user.user_metadata.phone ?? ""));
+        setEmail(user.email ?? "");
+      }
+      setLoading(false);
+    }).catch((error: unknown) => {
+      if (!active) return;
+      setSaveError(error instanceof Error ? error.message : "Could not load account details.");
+      setLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const saveProfile = async () => {
+    if (!supabase) {
+      setSaveError("Connect Supabase to update your profile.");
+      return;
+    }
+    if (fullName.trim().length < 2) {
+      setSaveError("Enter a name with at least two characters.");
+      return;
+    }
+    setSaving(true);
+    setSaveError("");
+    setFeedback("");
+    try {
+      const { error } = await supabase.auth.updateUser({
+        data: { full_name: fullName.trim(), phone: phone.trim() },
+      });
+      if (error) throw error;
+      setFeedback("Your profile has been updated.");
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Could not save your profile.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <SafeAreaView style={styles.safe} edges={["top"]}>
-      <Header title="Profile" subtitle="Account & preferences" />
-      <View style={styles.profileCard}>
-        <View style={styles.profileAvatar}>
-          <Text style={styles.profileAvatarText}>KL</Text>
+    <ProfileSubpage title="Personal information" subtitle="Account details">
+      {loading ? <ActivityIndicator style={styles.profileLoading} color="#5369D8" /> : (
+        <View style={styles.profileFormPanel}>
+          <View style={styles.profileFormAvatar}><Text style={styles.profileFormAvatarText}>{fullName.trim().slice(0, 1).toUpperCase() || "S"}</Text></View>
+          <Text style={styles.profileFormLabel}>Your name</Text>
+          <TextInput value={fullName} onChangeText={setFullName} placeholder="Full name" placeholderTextColor="#98A2B3" style={styles.profileFormInput} autoCapitalize="words" />
+          <Text style={styles.profileFormLabel}>Email address</Text>
+          <TextInput value={email} editable={false} style={[styles.profileFormInput, styles.profileFormInputDisabled]} />
+          <Text style={styles.profileFormHint}>Email is managed by your sign-in provider.</Text>
+          <Text style={styles.profileFormLabel}>Phone number</Text>
+          <TextInput value={phone} onChangeText={setPhone} placeholder="Add a phone number" placeholderTextColor="#98A2B3" style={styles.profileFormInput} keyboardType="phone-pad" />
+          {saveError ? <Text style={styles.profileFormError}>{saveError}</Text> : null}
+          {feedback ? (
+            <Animated.Text
+              entering={FadeIn.duration(180).reduceMotion(ReduceMotion.System)}
+              style={styles.profileFormSuccess}
+            >
+              {feedback}
+            </Animated.Text>
+          ) : null}
+          <Pressable accessibilityRole="button" disabled={saving} style={[styles.profilePrimaryButton, saving && styles.profileButtonDisabled]} onPress={() => { void saveProfile(); }}>
+            {saving ? <ActivityIndicator size="small" color="#fff" /> : null}
+            <Animated.Text
+              key={saving ? "saving" : "idle"}
+              entering={FadeIn.duration(140).reduceMotion(ReduceMotion.System)}
+              exiting={FadeOut.duration(100).reduceMotion(ReduceMotion.System)}
+              style={styles.profilePrimaryButtonText}
+            >
+              {saving ? "Saving..." : "Save changes"}
+            </Animated.Text>
+          </Pressable>
         </View>
-        <Text style={styles.profileName}>Khánh Linh</Text>
-        <Text style={styles.profileEmail}>student@vku.udn.vn</Text>
-      </View>
+      )}
+    </ProfileSubpage>
+  );
+}
 
-      {[
-        ["person-outline", "Personal information"],
-        ["notifications-outline", "Notifications"],
-        ["settings-outline", "App settings"],
-        ["help-circle-outline", "Help & support"],
-      ].map(([icon, label]) => (
-        <Pressable style={styles.menuItem} key={label}>
-          <Ionicons name={icon as any} size={22} color="#475467" />
-          <Text style={styles.menuText}>{label}</Text>
-          <Ionicons name="chevron-forward" size={19} color="#98A2B3" />
-        </Pressable>
-      ))}
-      <Pressable style={styles.menuItem} onPress={signOut}>
-        <Ionicons name="log-out-outline" size={22} color="#475467" />
-        <Text style={styles.menuText}>Sign Out</Text>
-        <Ionicons name="chevron-forward" size={19} color="#98A2B3" />
-      </Pressable>
+type NotificationPreferences = {
+  bookingUpdates: boolean;
+  bookingReminders: boolean;
+  learningUpdates: boolean;
+};
+
+function Notifications() {
+  const [preferences, setPreferences] = useState<NotificationPreferences>({
+    bookingUpdates: true,
+    bookingReminders: true,
+    learningUpdates: false,
+  });
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void AsyncStorage.getItem("study-room-notifications-v1").then((stored) => {
+      if (!active || !stored) return;
+      const parsed = JSON.parse(stored) as Partial<NotificationPreferences>;
+      setPreferences((current) => ({ ...current, ...parsed }));
+    }).catch(() => undefined).finally(() => {
+      if (active) setHydrated(true);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const togglePreference = (key: keyof NotificationPreferences) => {
+    const next = { ...preferences, [key]: !preferences[key] };
+    setPreferences(next);
+    void AsyncStorage.setItem("study-room-notifications-v1", JSON.stringify(next)).catch(() => undefined);
+  };
+
+  const options: { key: keyof NotificationPreferences; title: string; detail: string; icon: keyof typeof Ionicons.glyphMap }[] = [
+    { key: "bookingUpdates", title: "Booking updates", detail: "Changes to your reservation status", icon: "calendar-outline" },
+    { key: "bookingReminders", title: "Study reminders", detail: "Reminders before your booked time", icon: "time-outline" },
+    { key: "learningUpdates", title: "Learning sessions", detail: "New classes and study activities", icon: "book-outline" },
+  ];
+
+  return (
+    <ProfileSubpage title="Notifications" subtitle="Choose what to keep enabled">
+      <View style={styles.profileSettingsPanel}>
+        {options.map((option, index) => (
+          <View key={option.key}>
+            <View style={styles.profilePreferenceRow}>
+              <View style={styles.profileMenuIcon}><Ionicons name={option.icon} size={17} color="#18345F" /></View>
+              <View style={styles.profilePreferenceCopy}>
+                <Text style={styles.profilePreferenceTitle}>{option.title}</Text>
+                <Text style={styles.profilePreferenceDetail}>{option.detail}</Text>
+              </View>
+              <Switch
+                value={preferences[option.key]}
+                disabled={!hydrated}
+                onValueChange={() => togglePreference(option.key)}
+                trackColor={{ false: "#D7DCE5", true: "#AEB9F3" }}
+                thumbColor={preferences[option.key] ? "#5369D8" : "#fff"}
+              />
+            </View>
+            {index < options.length - 1 ? <View style={styles.profileSectionDivider} /> : null}
+          </View>
+        ))}
+      </View>
+      <Text style={styles.profilePageNote}>These preferences are saved on this device. Push delivery is not connected in this prototype.</Text>
+    </ProfileSubpage>
+  );
+}
+
+function AppSettings() {
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+  const destinations = [
+    { icon: "person-outline", title: "Personal information", detail: "Name, email and phone", route: "PersonalInfo" as const },
+    { icon: "notifications-outline", title: "Notifications", detail: "Booking and learning updates", route: "Notifications" as const },
+    { icon: "book-outline", title: "Booking handbook", detail: "How room reservations work", route: "Handbook" as const },
+  ];
+
+  return (
+    <ProfileSubpage title="App settings" subtitle="Your app and account">
+      <View style={styles.profileSettingsPanel}>
+        {destinations.map((item, index) => (
+          <View key={item.route}>
+            <Pressable accessibilityRole="button" style={styles.profileDestinationRow} onPress={() => navigation.navigate(item.route)}>
+              <View style={styles.profileMenuIcon}><Ionicons name={item.icon as keyof typeof Ionicons.glyphMap} size={17} color="#18345F" /></View>
+              <View style={styles.profilePreferenceCopy}>
+                <Text style={styles.profilePreferenceTitle}>{item.title}</Text>
+                <Text style={styles.profilePreferenceDetail}>{item.detail}</Text>
+              </View>
+              <Ionicons name="chevron-forward" size={17} color="#9AA6BA" />
+            </Pressable>
+            {index < destinations.length - 1 ? <View style={styles.profileSectionDivider} /> : null}
+          </View>
+        ))}
+        <View style={styles.profileVersionRow}>
+          <Text style={styles.profileVersionLabel}>App version</Text>
+          <Text style={styles.profileVersionValue}>1.0.0</Text>
+        </View>
+      </View>
+    </ProfileSubpage>
+  );
+}
+
+const HELP_FAQS = [
+  { question: "How long is a room or seat held?", answer: "A selected room or seat is held for 15 minutes while you complete checkout." },
+  { question: "When is my booking confirmed?", answer: "A transfer submission stays under review until an administrator verifies the payment." },
+  { question: "Can I reserve individual study seats?", answer: "Yes. Library and study rooms let you select one or more available seats for the same time range." },
+  { question: "Is payment verified automatically?", answer: "No. The app displays transfer instructions, but payment must be verified separately." },
+];
+
+function HelpCenter() {
+  const [openQuestion, setOpenQuestion] = useState<string | null>(HELP_FAQS[0].question);
+
+  return (
+    <ProfileSubpage title="Help & support" subtitle="Answers about room booking">
+      <View style={styles.profileFaqList}>
+        {HELP_FAQS.map((item) => {
+          const expanded = openQuestion === item.question;
+          return (
+            <Animated.View
+              style={styles.profileFaqItem}
+              key={item.question}
+              layout={LinearTransition.duration(190).reduceMotion(ReduceMotion.System)}
+            >
+              <Pressable accessibilityRole="button" style={styles.profileFaqQuestion} onPress={() => setOpenQuestion(expanded ? null : item.question)}>
+                <Text style={styles.profileFaqQuestionText}>{item.question}</Text>
+                <Ionicons name={expanded ? "remove" : "add"} size={18} color="#5369D8" />
+              </Pressable>
+              {expanded ? (
+                <Animated.Text
+                  entering={FadeIn.duration(170).reduceMotion(ReduceMotion.System)}
+                  exiting={FadeOut.duration(110).reduceMotion(ReduceMotion.System)}
+                  style={styles.profileFaqAnswer}
+                >
+                  {item.answer}
+                </Animated.Text>
+              ) : null}
+            </Animated.View>
+          );
+        })}
+      </View>
+      <View style={styles.profileContactBanner}>
+        <Ionicons name="headset-outline" size={22} color="#5369D8" />
+        <View style={styles.profilePreferenceCopy}>
+          <Text style={styles.profilePreferenceTitle}>Still need help?</Text>
+          <Text style={styles.profilePreferenceDetail}>Contact your campus administrator for account assistance.</Text>
+        </View>
+      </View>
+    </ProfileSubpage>
+  );
+}
+
+function Handbook() {
+  const steps = [
+    { title: "Choose a space", detail: "Browse meeting rooms, library seats and study spaces." },
+    { title: "Select a time", detail: "Pick a date, start time and booking duration." },
+    { title: "Review and pay", detail: "Check your booking details and follow the bank transfer instructions." },
+    { title: "Wait for verification", detail: "Your reservation is confirmed after the transfer is reviewed." },
+  ];
+
+  return (
+    <ProfileSubpage title="Booking handbook" subtitle="A quick guide to reserving a space">
+      <View style={styles.profileHandbookList}>
+        {steps.map((step, index) => (
+          <Animated.View
+            style={styles.profileHandbookStep}
+            key={step.title}
+            entering={FadeInDown.delay(index * 45).duration(280).reduceMotion(ReduceMotion.System)}
+          >
+            <View style={styles.profileStepNumber}><Text style={styles.profileStepNumberText}>{index + 1}</Text></View>
+            <View style={styles.profileHandbookCopy}>
+              <Text style={styles.profilePreferenceTitle}>{step.title}</Text>
+              <Text style={styles.profilePreferenceDetail}>{step.detail}</Text>
+            </View>
+          </Animated.View>
+        ))}
+      </View>
+      <View style={styles.profilePageNotice}>
+        <Ionicons name="time-outline" size={18} color="#5369D8" />
+        <Text style={styles.profilePageNote}>Temporary holds expire after 15 minutes. Submit your transfer before the hold expires.</Text>
+      </View>
+    </ProfileSubpage>
+  );
+}
+
+function Community() {
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+  const [search, setSearch] = useState("");
+  const sessions = CLASS_SESSIONS.filter((session) =>
+    `${session.title} ${session.code} ${session.location}`.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  return (
+    <ProfileSubpage title="Community" subtitle="Learn and study together">
+      <Text style={styles.profileCommunityTitle}>Make room for new ideas.</Text>
+      <View style={styles.profileCommunitySearch}>
+        <Ionicons name="search-outline" size={18} color="#7A879B" />
+        <TextInput value={search} onChangeText={setSearch} placeholder="Search sessions..." placeholderTextColor="#8C97A9" style={styles.profileCommunityInput} />
+      </View>
+      <View style={styles.profileCommunityList}>
+        {sessions.map((session, index) => (
+          <Animated.View
+            style={styles.profileCommunityItem}
+            key={session.id}
+            entering={FadeInDown.delay(index * 45).duration(280).reduceMotion(ReduceMotion.System)}
+          >
+            <View style={[styles.profileCommunityAccent, { backgroundColor: session.color }]} />
+            <View style={styles.profileCommunityCopy}>
+              <Text style={styles.profileCommunityCode}>{session.code}</Text>
+              <Text style={styles.profileCommunitySessionTitle}>{session.title}</Text>
+              <Text style={styles.profileCommunityDetail}>{session.day} · {session.time}</Text>
+              <Text style={styles.profileCommunityDetail}>{session.location} · {session.seats} seats</Text>
+              <Pressable accessibilityRole="button" style={styles.profileCommunityAction} onPress={() => navigation.navigate("MainTabs", { screen: "Classes" })}>
+                <Text style={styles.profileCommunityActionText}>Explore sessions</Text>
+                <Ionicons name="arrow-forward" size={14} color="#5369D8" />
+              </Pressable>
+            </View>
+          </Animated.View>
+        ))}
+        {sessions.length === 0 ? <Text style={styles.profilePageNote}>No sessions match this search.</Text> : null}
+      </View>
+    </ProfileSubpage>
+  );
+}
+
+function FavoritesScreen() {
+  const { favoriteRoomIds, toggleFavorite, loading: favoritesLoading, loadError } = useRoomFavorites();
+  const roomCatalogQuery = useQuery<Room[], Error>({
+    queryKey: ["room-catalog"],
+    queryFn: getRoomCatalog,
+  });
+  const rooms = roomCatalogQuery.data ?? ROOMS;
+  const favoriteRooms = rooms.filter((room) => favoriteRoomIds.includes(room.id));
+
+  return (
+    <ProfileSubpage title="Saved spaces" subtitle="Rooms and study spots you like">
+      {favoritesLoading || roomCatalogQuery.isLoading ? (
+        <ActivityIndicator style={styles.profileLoading} color="#5369D8" />
+      ) : loadError ? (
+        <View style={styles.profileFavoritesEmpty}>
+          <View style={styles.profileFavoritesEmptyIcon}><Ionicons name="alert-circle-outline" size={26} color="#5369D8" /></View>
+          <Text style={styles.profileFavoritesEmptyTitle}>Could not load saved spaces</Text>
+          <Text style={styles.profilePageNote}>{loadError}</Text>
+        </View>
+      ) : favoriteRooms.length > 0 ? (
+        <View style={styles.profileFavoritesList}>
+          {favoriteRooms.map((room, index) => (
+            <Animated.View
+              key={room.id}
+              entering={FadeInDown.delay(index * 45).duration(280).reduceMotion(ReduceMotion.System)}
+            >
+              <RoomCard room={room} isFavorite onToggleFavorite={toggleFavorite} />
+            </Animated.View>
+          ))}
+        </View>
+      ) : (
+        <View style={styles.profileFavoritesEmpty}>
+          <View style={styles.profileFavoritesEmptyIcon}><Ionicons name="heart-outline" size={26} color="#5369D8" /></View>
+          <Text style={styles.profileFavoritesEmptyTitle}>No saved spaces yet</Text>
+          <Text style={styles.profilePageNote}>Tap the heart on a room to keep it here.</Text>
+        </View>
+      )}
+    </ProfileSubpage>
+  );
+}
+
+function Profile() {
+  const navigation = useNavigation<BottomTabNavigationProp<MainTabParamList>>();
+  const rootNavigation = navigation.getParent<NativeStackNavigationProp<RootStackParamList>>();
+  const [profileName, setProfileName] = useState("Student");
+  const [profileEmail, setProfileEmail] = useState("");
+
+  useEffect(() => {
+    if (!supabase) return;
+    let active = true;
+    void supabase.auth.getUser().then(({ data }) => {
+      if (!active || !data.user) return;
+      const fullName = String(data.user.user_metadata.full_name ?? "").trim();
+      setProfileName(fullName || data.user.email?.split("@")[0] || "Student");
+      setProfileEmail(data.user.email ?? "");
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  const signOut = () => {
+    if (supabase) void supabase.auth.signOut();
+  };
+  const initials = profileName
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+  const sections = [
+    {
+      title: "ACCOUNT",
+      items: [
+        { icon: "person-outline", label: "Personal information", onPress: () => rootNavigation?.navigate("PersonalInfo") },
+        { icon: "calendar-outline", label: "My bookings", onPress: () => navigation.navigate("Bookings") },
+        { icon: "heart-outline", label: "Saved spaces", onPress: () => rootNavigation?.navigate("Favorites") },
+      ],
+    },
+    {
+      title: "PREFERENCES",
+      items: [
+        { icon: "notifications-outline", label: "Notifications", onPress: () => rootNavigation?.navigate("Notifications") },
+        { icon: "settings-outline", label: "App settings", onPress: () => rootNavigation?.navigate("AppSettings") },
+      ],
+    },
+    {
+      title: "LEARN",
+      items: [
+        { icon: "book-outline", label: "Booking handbook", onPress: () => rootNavigation?.navigate("Handbook") },
+        { icon: "people-outline", label: "Community", onPress: () => rootNavigation?.navigate("Community") },
+      ],
+    },
+    {
+      title: "SUPPORT",
+      items: [
+        { icon: "help-circle-outline", label: "FAQs", onPress: () => rootNavigation?.navigate("HelpCenter") },
+      ],
+    },
+  ] as const;
+
+  return (
+    <SafeAreaView style={styles.profileScreen} edges={["top"]}>
+      <ScrollView contentContainerStyle={styles.profileScroll} showsVerticalScrollIndicator={false}>
+        <View style={styles.profilePanel}>
+          <View style={styles.profileIdentity}>
+            <View style={styles.profileAvatar}><Text style={styles.profileAvatarText}>{initials || "S"}</Text></View>
+            <View style={styles.profileIdentityCopy}>
+              <Text style={styles.profileName} numberOfLines={1}>{profileName}</Text>
+              <Text style={styles.profileEmail} numberOfLines={1}>{profileEmail || "Study Room Booking"}</Text>
+            </View>
+          </View>
+
+          <View style={styles.profileDivider} />
+
+          {sections.map((section, sectionIndex) => (
+            <View key={section.title} style={styles.profileSection}>
+              <Text style={styles.profileSectionTitle}>{section.title}</Text>
+              {section.items.map((item) => (
+                <Pressable key={item.label} accessibilityRole="button" style={styles.profileMenuItem} onPress={item.onPress}>
+                  <View style={styles.profileMenuIcon}><Ionicons name={item.icon} size={17} color="#18345F" /></View>
+                  <Text style={styles.profileMenuText}>{item.label}</Text>
+                  <Ionicons name="chevron-forward" size={17} color="#9AA6BA" />
+                </Pressable>
+              ))}
+              {sectionIndex < sections.length - 1 ? <View style={styles.profileSectionDivider} /> : null}
+            </View>
+          ))}
+
+          <Pressable accessibilityRole="button" style={styles.profileHelpBanner} onPress={() => rootNavigation?.navigate("HelpCenter")}>
+            <Ionicons name="headset-outline" size={23} color="#5369D8" />
+            <View style={styles.profileHelpCopy}>
+              <Text style={styles.profileHelpTitle}>Need a hand?</Text>
+              <Text style={styles.profileHelpText}>Get help with your account</Text>
+            </View>
+            <Ionicons name="arrow-forward" size={16} color="#5369D8" />
+          </Pressable>
+
+          <Pressable accessibilityRole="button" style={styles.profileSignOut} onPress={signOut}>
+            <Ionicons name="log-out-outline" size={18} color="#B54754" />
+            <Text style={styles.profileSignOutText}>Sign out</Text>
+          </Pressable>
+        </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -1944,10 +2706,24 @@ function AppContent() {
 
   return (
     <NavigationContainer>
-      <Stack.Navigator id="RootStackNavigator" screenOptions={{ headerShown: false }}>
+      <Stack.Navigator
+        id="RootStackNavigator"
+        screenOptions={{
+          headerShown: false,
+          animation: "slide_from_right",
+          animationDuration: 230,
+        }}
+      >
         <Stack.Screen name="MainTabs" component={MainTabs} />
         <Stack.Screen name="RoomDetail" component={RoomDetail} />
         <Stack.Screen name="Booking" component={BookingScreen} />
+        <Stack.Screen name="PersonalInfo" component={PersonalInfo} />
+        <Stack.Screen name="Favorites" component={FavoritesScreen} />
+        <Stack.Screen name="Notifications" component={Notifications} />
+        <Stack.Screen name="AppSettings" component={AppSettings} />
+        <Stack.Screen name="HelpCenter" component={HelpCenter} />
+        <Stack.Screen name="Handbook" component={Handbook} />
+        <Stack.Screen name="Community" component={Community} />
       </Stack.Navigator>
     </NavigationContainer>
   );
@@ -1955,15 +2731,18 @@ function AppContent() {
 
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <SafeAreaProvider>
-        <AppContent />
-      </SafeAreaProvider>
-    </QueryClientProvider>
+    <GestureHandlerRootView style={styles.gestureRoot}>
+      <QueryClientProvider client={queryClient}>
+        <SafeAreaProvider>
+          <AppContent />
+        </SafeAreaProvider>
+      </QueryClientProvider>
+    </GestureHandlerRootView>
   );
 }
 
 const styles = StyleSheet.create({
+  gestureRoot: { flex: 1 },
   authLoading: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#fff" },
   authPage: { flex: 1, backgroundColor: "#fff" },
   authKeyboard: { flex: 1 },
@@ -2069,14 +2848,19 @@ const styles = StyleSheet.create({
   homeEyebrow: { color: "#667085", fontSize: 10, fontWeight: "800", letterSpacing: 1.8 },
   homeTitle: { color: "#18202B", fontSize: 27, fontWeight: "800", marginTop: 4 },
   homeAvatar: { width: 44, height: 44, borderRadius: 22, backgroundColor: "#E8EAFE", alignItems: "center", justifyContent: "center" },
-  homeHero: { height: 282, marginHorizontal: 18, borderRadius: 23, overflow: "hidden", justifyContent: "space-between", padding: 15 },
+  homeHeroFrame: { height: 282, marginHorizontal: 18, borderRadius: 23, overflow: "hidden" },
+  homeHero: { flex: 1, justifyContent: "space-between", padding: 15 },
   homeHeroImage: { borderRadius: 23 },
   homeHeroTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   heroAvailability: { minHeight: 30, paddingHorizontal: 11, borderRadius: 16, backgroundColor: "rgba(18, 24, 31, 0.40)", flexDirection: "row", alignItems: "center", gap: 7 },
   heroAvailabilityDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: "#73D49A" },
   heroAvailabilityText: { color: "#fff", fontSize: 10, fontWeight: "700" },
-  homeHeroBottom: { borderRadius: 17, overflow: "hidden" },
+  homeHeroBottom: { borderRadius: 17, gap: 7 },
   homeHeroGlass: { paddingHorizontal: 16, paddingVertical: 14, borderRadius: 17, overflow: "hidden", backgroundColor: "rgba(20, 27, 32, 0.28)" },
+  homeHeroPagination: { height: 24, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3 },
+  homeHeroDotButton: { width: 24, height: 24, alignItems: "center", justifyContent: "center" },
+  homeHeroDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: "rgba(255,255,255,0.65)" },
+  homeHeroDotActive: { width: 19, backgroundColor: "#fff" },
   homeHeroKicker: { color: "#E7EAF0", fontSize: 9, fontWeight: "800", letterSpacing: 1.3 },
   homeHeroTitle: { color: "#fff", fontSize: 23, lineHeight: 27, fontWeight: "800", marginTop: 5 },
   homeHeroAction: { alignSelf: "flex-start", height: 37, paddingHorizontal: 12, marginTop: 11, borderRadius: 20, backgroundColor: "#fff", flexDirection: "row", alignItems: "center", gap: 9 },
@@ -2091,7 +2875,8 @@ const styles = StyleSheet.create({
   homeSectionHeader: { marginHorizontal: 22, marginTop: 5, marginBottom: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   homeSectionTitle: { color: "#18202B", fontSize: 18, fontWeight: "800" },
   homeSectionCaption: { color: "#8A929F", fontSize: 11, marginTop: 3 },
-  homeRoomList: { paddingHorizontal: 18, gap: 11 },
+  homeRoomItem: { paddingHorizontal: 18, marginBottom: 11 },
+  homeEmptyText: { marginHorizontal: 20, paddingVertical: 12 },
   roomCardImageWrap: { width: 112, minHeight: 128, position: "relative" },
   roomCategoryPill: { position: "absolute", left: 8, top: 8, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 11, backgroundColor: "rgba(255,255,255,0.92)" },
   roomCategoryText: { color: "#48536A", fontSize: 9, fontWeight: "700" },
@@ -2140,10 +2925,12 @@ const styles = StyleSheet.create({
   list: { paddingHorizontal: 20, paddingBottom: 25 },
   column: { justifyContent: "space-between" },
   roomCard: {
-    width: "100%", minHeight: 148, backgroundColor: "#fff", borderRadius: 17,
-    padding: 9, flexDirection: "row", gap: 13, overflow: "hidden",
+    width: "100%", minHeight: 148, position: "relative", backgroundColor: "#fff", borderRadius: 17,
+    padding: 9, overflow: "hidden",
     borderWidth: 1, borderColor: "#EAECF0",
   },
+  roomCardContent: { flex: 1, minWidth: 0, flexDirection: "row", gap: 13 },
+  roomCardFavorite: { position: "absolute", top: 14, left: 82, zIndex: 2, width: 32, height: 32, borderRadius: 16, backgroundColor: "rgba(255,255,255,0.94)", borderWidth: 1, borderColor: "rgba(234,236,240,0.8)", alignItems: "center", justifyContent: "center" },
   roomImage: { width: "100%", height: "100%", borderRadius: 12 },
   roomBody: { flex: 1, paddingVertical: 4, paddingRight: 3 },
   rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 5 },
@@ -2381,23 +3168,90 @@ const styles = StyleSheet.create({
   emptyTitle: { marginTop: 16, fontSize: 19, fontWeight: "800", color: "#101828" },
   emptyText: { textAlign: "center", color: "#667085", lineHeight: 20, marginTop: 7 },
 
-  profileCard: {
-    margin: 20, padding: 25, borderRadius: 20, backgroundColor: "#fff",
-    alignItems: "center", borderWidth: 1, borderColor: "#EAECF0",
-  },
+  profileScreen: { flex: 1, backgroundColor: "#E9EDF5" },
+  profileScroll: { flexGrow: 1, paddingHorizontal: 18, paddingTop: 18, paddingBottom: 22 },
+  profilePanel: { flexGrow: 1, paddingHorizontal: 19, paddingTop: 23, paddingBottom: 13, borderRadius: 30, backgroundColor: "#fff" },
+  profileIdentity: { minHeight: 64, flexDirection: "row", alignItems: "center", gap: 13, paddingBottom: 19 },
   profileAvatar: {
-    width: 78, height: 78, borderRadius: 39, backgroundColor: "#2457F5",
+    width: 52, height: 52, borderRadius: 15, backgroundColor: "#E9EDFF",
     alignItems: "center", justifyContent: "center",
   },
-  profileAvatarText: { color: "#fff", fontSize: 25, fontWeight: "800" },
-  profileName: { marginTop: 13, fontSize: 20, fontWeight: "800", color: "#101828" },
-  profileEmail: { marginTop: 4, color: "#667085", fontSize: 13 },
-  menuItem: {
-    marginHorizontal: 20, marginBottom: 10, padding: 17, borderRadius: 14,
-    backgroundColor: "#fff", flexDirection: "row", alignItems: "center", gap: 12,
-    borderWidth: 1, borderColor: "#EAECF0",
-  },
-  menuText: { flex: 1, color: "#344054", fontSize: 14, fontWeight: "600" },
+  profileAvatarText: { color: "#203A68", fontSize: 18, fontWeight: "800" },
+  profileIdentityCopy: { flex: 1, minWidth: 0 },
+  profileName: { color: "#142749", fontSize: 14, fontWeight: "800" },
+  profileEmail: { marginTop: 4, color: "#758197", fontSize: 10 },
+  profileDivider: { height: 1, backgroundColor: "#EEF0F4" },
+  profileSection: { paddingTop: 17 },
+  profileSectionTitle: { marginBottom: 5, color: "#929CB0", fontSize: 9, fontWeight: "800" },
+  profileMenuItem: { minHeight: 47, flexDirection: "row", alignItems: "center", gap: 11 },
+  profileMenuIcon: { width: 33, height: 33, borderRadius: 10, backgroundColor: "#F1F3FA", alignItems: "center", justifyContent: "center" },
+  profileMenuText: { flex: 1, color: "#1B2D4D", fontSize: 11, fontWeight: "600" },
+  profileSectionDivider: { height: 1, marginTop: 13, backgroundColor: "#EEF0F4" },
+  profileHelpBanner: { minHeight: 62, marginTop: 21, paddingHorizontal: 14, borderRadius: 13, backgroundColor: "#ECEEFF", flexDirection: "row", alignItems: "center", gap: 11 },
+  profileHelpCopy: { flex: 1 },
+  profileHelpTitle: { color: "#344A82", fontSize: 11, fontWeight: "800" },
+  profileHelpText: { marginTop: 3, color: "#6578BB", fontSize: 9 },
+  profileSignOut: { minHeight: 44, marginTop: 8, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7 },
+  profileSignOutText: { color: "#A84956", fontSize: 11, fontWeight: "700" },
+  profileSubpage: { flex: 1, backgroundColor: "#F2F4F9" },
+  profileSubpageHeader: { minHeight: 76, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: "#F2F4F9" },
+  profileBackButton: { width: 40, height: 40, borderRadius: 13, backgroundColor: "#fff", alignItems: "center", justifyContent: "center" },
+  profileSubpageHeading: { flex: 1 },
+  profileSubpageTitle: { color: "#172744", fontSize: 16, fontWeight: "800" },
+  profileSubpageSubtitle: { marginTop: 3, color: "#7A879B", fontSize: 10 },
+  profileBackButtonSpacer: { width: 40 },
+  profileSubpageContent: { flexGrow: 1, paddingHorizontal: 18, paddingTop: 7, paddingBottom: 28 },
+  profileFormPanel: { padding: 19, borderRadius: 19, backgroundColor: "#fff" },
+  profileFormAvatar: { width: 60, height: 60, marginBottom: 23, borderRadius: 17, backgroundColor: "#E9EDFF", alignItems: "center", justifyContent: "center", alignSelf: "center" },
+  profileFormAvatarText: { color: "#203A68", fontSize: 22, fontWeight: "800" },
+  profileFormLabel: { marginTop: 15, marginBottom: 7, color: "#34445F", fontSize: 10, fontWeight: "700" },
+  profileFormInput: { minHeight: 43, paddingHorizontal: 12, borderWidth: 1, borderColor: "#DDE2EC", borderRadius: 9, backgroundColor: "#F4F6FC", color: "#172744", fontSize: 11 },
+  profileFormInputDisabled: { color: "#7A879B" },
+  profileFormHint: { marginTop: 5, color: "#8A95A8", fontSize: 9 },
+  profileFormError: { marginTop: 14, color: "#B42318", fontSize: 11, lineHeight: 16 },
+  profileFormSuccess: { marginTop: 14, color: "#027A48", fontSize: 11 },
+  profilePrimaryButton: { minHeight: 46, marginTop: 21, borderRadius: 11, backgroundColor: "#5369D8", alignItems: "center", justifyContent: "center" },
+  profilePrimaryButtonText: { color: "#fff", fontSize: 12, fontWeight: "800" },
+  profileButtonDisabled: { opacity: 0.65 },
+  profileLoading: { marginTop: 60 },
+  profileSettingsPanel: { paddingHorizontal: 14, borderRadius: 17, backgroundColor: "#fff" },
+  profilePreferenceRow: { minHeight: 70, flexDirection: "row", alignItems: "center", gap: 10 },
+  profilePreferenceCopy: { flex: 1 },
+  profilePreferenceTitle: { color: "#1B2D4D", fontSize: 11, fontWeight: "700" },
+  profilePreferenceDetail: { marginTop: 4, color: "#7A879B", fontSize: 9, lineHeight: 14 },
+  profilePageNote: { marginTop: 15, color: "#758197", fontSize: 10, lineHeight: 16 },
+  profileDestinationRow: { minHeight: 66, flexDirection: "row", alignItems: "center", gap: 10 },
+  profileVersionRow: { minHeight: 46, marginTop: 4, borderTopWidth: 1, borderTopColor: "#EEF0F4", flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  profileVersionLabel: { color: "#758197", fontSize: 10 },
+  profileVersionValue: { color: "#34445F", fontSize: 10, fontWeight: "700" },
+  profileFaqList: { gap: 9 },
+  profileFaqItem: { paddingHorizontal: 14, paddingVertical: 4, borderRadius: 13, backgroundColor: "#fff" },
+  profileFaqQuestion: { minHeight: 48, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 },
+  profileFaqQuestionText: { flex: 1, color: "#1B2D4D", fontSize: 11, fontWeight: "700" },
+  profileFaqAnswer: { paddingBottom: 13, color: "#758197", fontSize: 10, lineHeight: 16 },
+  profileContactBanner: { minHeight: 66, marginTop: 17, paddingHorizontal: 14, borderRadius: 13, backgroundColor: "#ECEEFF", flexDirection: "row", alignItems: "center", gap: 11 },
+  profileHandbookList: { gap: 10 },
+  profileHandbookStep: { minHeight: 78, padding: 14, borderRadius: 14, backgroundColor: "#fff", flexDirection: "row", alignItems: "center", gap: 12 },
+  profileStepNumber: { width: 31, height: 31, borderRadius: 10, backgroundColor: "#E9EDFF", alignItems: "center", justifyContent: "center" },
+  profileStepNumberText: { color: "#5369D8", fontSize: 12, fontWeight: "800" },
+  profileHandbookCopy: { flex: 1 },
+  profilePageNotice: { marginTop: 16, padding: 13, borderRadius: 12, backgroundColor: "#ECEEFF", flexDirection: "row", alignItems: "center", gap: 9 },
+  profileCommunityTitle: { marginTop: 10, marginBottom: 17, color: "#172744", fontSize: 22, lineHeight: 28, fontWeight: "800", textAlign: "center" },
+  profileCommunitySearch: { minHeight: 45, paddingHorizontal: 13, borderWidth: 1, borderColor: "#DDE2EC", borderRadius: 10, backgroundColor: "#F4F6FC", flexDirection: "row", alignItems: "center", gap: 9 },
+  profileCommunityInput: { flex: 1, color: "#172744", fontSize: 11 },
+  profileCommunityList: { marginTop: 16, gap: 11 },
+  profileCommunityItem: { minHeight: 145, overflow: "hidden", borderRadius: 14, backgroundColor: "#fff", flexDirection: "row" },
+  profileCommunityAccent: { width: 4 },
+  profileCommunityCopy: { flex: 1, padding: 14 },
+  profileCommunityCode: { color: "#7A879B", fontSize: 9, fontWeight: "800" },
+  profileCommunitySessionTitle: { marginTop: 5, color: "#1B2D4D", fontSize: 13, fontWeight: "800" },
+  profileCommunityDetail: { marginTop: 5, color: "#758197", fontSize: 10 },
+  profileCommunityAction: { alignSelf: "flex-start", marginTop: 11, flexDirection: "row", alignItems: "center", gap: 6 },
+  profileCommunityActionText: { color: "#5369D8", fontSize: 10, fontWeight: "700" },
+  profileFavoritesList: { gap: 11 },
+  profileFavoritesEmpty: { minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 26, borderRadius: 17, backgroundColor: "#fff" },
+  profileFavoritesEmptyIcon: { width: 54, height: 54, borderRadius: 17, backgroundColor: "#ECEEFF", alignItems: "center", justifyContent: "center" },
+  profileFavoritesEmptyTitle: { marginTop: 13, color: "#1B2D4D", fontSize: 14, fontWeight: "800" },
   tabBar: {
     height: 70, paddingBottom: 8, paddingTop: 7, borderTopColor: "#EAECF0",
     backgroundColor: "#fff",

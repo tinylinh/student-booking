@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Study Room Booking App - Mini Project 2
 
 UI follows the provided Meeting Room / Study Room Booking reference.
@@ -34,6 +33,7 @@ Run the SQL migration before using room booking:
 2. Open [supabase/migrations/202610020001_booking_reservations.sql](supabase/migrations/202610020001_booking_reservations.sql), paste the full script into a new query, and run it once.
 3. Confirm `booking_rooms`, `bookings`, and `booking_resources` exist, along with the `hold_booking_resources`, `get_room_availability`, `submit_booking_transfer`, and `cancel_booking_hold` functions.
 4. Reload the app. Room names, capacity, amenities, and hourly rates load from `booking_rooms`; photos remain bundled and are matched by room ID.
+5. To enable per-user saved spaces, run [supabase/migrations/202610050001_user_favorites.sql](supabase/migrations/202610050001_user_favorites.sql) in SQL Editor after the booking migration. It creates `user_favorites` with row-level security so each signed-in user can only read and change their own favorites.
 
 The hold RPC inserts the booking and all requested resources in one transaction. A PostgreSQL GiST exclusion constraint rejects overlapping time ranges for the same room/seat. Changing a selection atomically replaces the previous temporary hold. Holds expire after 15 minutes and are cleaned when a new hold or availability request runs. The app subscribes to `booking_resources` for availability and `bookings` for status changes; the database constraint is the final duplicate-booking protection.
 
@@ -75,22 +75,20 @@ Meeting rooms are booked as a whole room (10, 20, or 40 people). Library and stu
 ## Main requirements covered
 - React Native + Expo Managed
 - TypeScript
-- React Navigation 7: Stack + Bottom Tabs
-- Zustand: booking state
-- TanStack Query: QueryClient setup
+- React Navigation 7: typed Stack + Bottom Tabs
+- Zustand: user-scoped persisted booking cache; temporary holds stay in memory
+- TanStack Query: Supabase room catalog with pull-to-refresh
 - Safe area context
-- FlatList room feed
+- FlatList room feed with `FadeInDown` card animations
 - Search + filter chips
 - Room detail
 - Date/time-slot booking
 - Per-seat selection with available, held, and booked states
 - Fifteen-minute temporary room/seat holds and database conflict prevention
 - Availability counts for each room/date/time slot
+- Per-user saved rooms with animated favorite controls
 - My Bookings
 - Profile
 
 ## Booking data
 Room catalog and booking/payment records are stored in Supabase Postgres. Reservations are keyed by room, resource ID, and overlapping time range. Zustand only caches data for rendering and is not the source of truth. Temporary holds expire after 15 minutes. Payment submissions remain pending until independently verified. Class sessions and registrations remain sample local state.
-=======
-# student-booking
->>>>>>> origin/main

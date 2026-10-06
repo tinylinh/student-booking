@@ -94,6 +94,30 @@ export async function getBookingRooms(): Promise<StoredRoom[]> {
   return (data ?? []) as StoredRoom[];
 }
 
+export async function getMyFavoriteRoomIds(): Promise<string[]> {
+  const { data, error } = await getClient()
+    .from("user_favorites")
+    .select("room_id")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []).map((row: { room_id: string }) => row.room_id);
+}
+
+export async function addFavoriteRoom(roomId: string) {
+  const { error } = await getClient()
+    .from("user_favorites")
+    .upsert({ room_id: roomId }, { onConflict: "user_id,room_id", ignoreDuplicates: true });
+  if (error) throw error;
+}
+
+export async function removeFavoriteRoom(roomId: string) {
+  const { error } = await getClient()
+    .from("user_favorites")
+    .delete()
+    .eq("room_id", roomId);
+  if (error) throw error;
+}
+
 export async function holdBookingResources(input: {
   roomId: string;
   date: string;
